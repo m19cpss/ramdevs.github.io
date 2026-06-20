@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Scanner System</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/dist/face-api.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <style>
+    body {
+      margin: 0; padding: 0; background-color: #111; color: white;
+      font-family: 'Prompt', sans-serif; overflow: hidden;
+      display: none; /* ซ่อนค่าเริ่มต้น ถ้าไม่มีข้อมูลส่งมาจะเป็นหน้าจอดำ */
+      justify-content: center; align-items: center; height: 100vh; flex-direction: column;
+    }
+    #scanner-container {
+      position: relative; border-radius: 20px; overflow: hidden;
+      border: 4px solid #0d6efd; width: 90%; max-width: 400px; height: 350px;
+    }
+    video, canvas {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    #instruction { margin-bottom: 20px; font-weight: bold; text-align: center; text-shadow: 2px 2px 4px rgba(0,0,0,0.8); }
+    .btn-cancel { margin-top: 20px; padding: 10px 30px; border-radius: 20px; background: #dc3545; color: white; border: none; font-size: 1rem; cursor: pointer; }
+    #colorFlashOverlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      opacity: 0; z-index: 999; pointer-events: none; transition: all 0.15s ease;
+    }
+  </style>
+</head>
+<body>
+
+  <h3 id="instruction">กำลังโหลดข้อมูล...</h3>
+  <div id="scanner-container">
+    <video id="faceVideo" autoplay muted playsinline></video>
+    <canvas id="faceCanvas"></canvas>
+    <div id="colorFlashOverlay"></div>
+  </div>
+  <button class="btn-cancel" onclick="goBack()">ยกเลิก / กลับ</button>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const mode = urlParams.get('mode');
+    const studentId = urlParams.get('id');
+    const studentName = urlParams.get('name') || "";
+    const studentEmail = urlParams.get('email') || "";
+    const gasApi = urlParams.get('gasApi');
+    const returnUrl = urlParams.get('returnUrl');
+
+    let savedDescriptor = null;
+    let scanInterval;
+    let livenessActions = [];
+    let currentActionIdx = 0, blinkCount = 0, eyeOpenStatus = true, nodStartY = 0, isNoddingDown = false;
+
+    // ระบบป้องกัน: ถ้า URL พารามิเตอร์ครบถ้วนถึงจะแสดงหน้าต่างสแกน
+    if (mode && studentId && gasApi && returnUrl) {
+        document.body.style.display = 'flex';
+        initSystem();
+    }
+
+    async function initSystem() {
+        if (mode === 'login') {
+            document.getElementById('instruction').innerText = "กำลังดึงข้อมูลใบหน้าจากฐานข้อมูล...";
+            try {
+                // เรียกใช้ GAS API แบบ text/plain
+                const res = await fetch(gasApi, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ action: 'getFace', id: studentId })
+                });
+                const result = await res.json();
+                if (!result.success) {
+                    Swal.fire('ข้อผิดพลาด', result.message, 'error').then(goBack);
+                    return;
+                }
+                savedDescriptor = new Float32Array(JSON.parse(result.descriptor));
+            } catch (err) {
+                Swal.fire('ข้อผิดพลาด', 'ไม่สามารถเชื่อมต่อฐานข้อมูลได้', 'error').then(goBack);
+                return;
+            }
+        }
+        startCamera();
+    }
+
+    async function startCamera() {
+        document.getElementById('instruction').innerText = "กำลังโหลดโมเดล AI...";
+        const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+        await Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+            faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+            faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+            faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL)
+        ]);
+
+        const video = document.getElementById('faceVideo');
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } }).then(stream => {
+            video.srcObject = stream;
+        }).catch(err => {
+            Swal.fire('ข้อผิดพลาด', 'ไม่สามารถเข้าถึงกล้องได้', 'error').then(goBack);
+        });
+
+        video.onplay = () => {
+            livenessActions = ['left', 'right', 'nod', 'blink', 'smile'].sort(() => Math.random() - 0.5);
+            promptNextLivenessAction();
+
+            scanInterval = setInterval(async () => {
+                const detections = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+                    .withFaceLandmarks().withFaceExpressions().withFaceDescriptor();
+                
+                if (detections) checkLiveness(detections);
+                else document.getElementById('instruction').innerText = 'ไม่พบใบหน้า กรุณาอยู่ในเฟรม';
+            }, 150);
+        };
+    }
+
+    function promptNextLivenessAction() {
+        if(currentActionIdx >= livenessActions.length) {
+            completeLiveness();
+            return;
+        }
+        const msgs = { 'left': 'หันหน้าไปทางซ้าย', 'right': 'หันหน้าไปทางขวา', 'nod': 'พยักหน้าช้าๆ', 'blink': 'กระพริบตา 2-3 ครั้ง', 'smile': 'ยิ้มให้เห็นฟัน' };
+        document.getElementById('instruction').innerText = msgs[livenessActions[currentActionIdx]];
+        document.getElementById('instruction').style.color = '#fff';
+    }
+
+    function checkLiveness(detections) {
+        if(currentActionIdx >= livenessActions.length) return;
+        const action = livenessActions[currentActionIdx];
+        const landmarks = detections.landmarks;
+        const nose = landmarks.getNose()[3];
+        const leftEdge = landmarks.getJawOutline()[0];
+        const rightEdge = landmarks.getJawOutline()[16];
+        
+        let passed = false;
+        const distLeft = Math.abs(nose.x - leftEdge.x);
+        const distRight = Math.abs(rightEdge.x - nose.x);
+
+        if (action === 'left' && distLeft < distRight * 0.5) passed = true;
+        else if (action === 'right' && distRight < distLeft * 0.5) passed = true;
+        else if (action === 'smile' && detections.expressions.happy > 0.85) passed = true;
+        else if (action === 'nod') {
+            if(nodStartY === 0) nodStartY = nose.y;
+            if(nose.y - nodStartY > 15) isNoddingDown = true;
+            if(isNoddingDown && nodStartY - nose.y > 10) passed = true;
+        } else if (action === 'blink') {
+            const getEAR = (eye) => {
+                const v1 = Math.hypot(eye[1].x - eye[5].x, eye[1].y - eye[5].y);
+                const v2 = Math.hypot(eye[2].x - eye[4].x, eye[2].y - eye[4].y);
+                const h = Math.hypot(eye[0].x - eye[3].x, eye[0].y - eye[3].y);
+                return (v1 + v2) / (2.0 * h);
+            };
+            const ear = (getEAR(landmarks.getLeftEye()) + getEAR(landmarks.getRightEye())) / 2;
+            if (ear < 0.22 && eyeOpenStatus) { blinkCount++; eyeOpenStatus = false; } 
+            else if (ear >= 0.25) { eyeOpenStatus = true; }
+            document.getElementById('instruction').innerText = 'กระพริบตา (' + blinkCount + '/2)';
+            if (blinkCount >= 2) passed = true;
+        }
+
+        if (passed) {
+            currentActionIdx++;
+            document.getElementById('instruction').style.color = '#00ff00';
+            setTimeout(promptNextLivenessAction, 400);
+        }
+    }
+
+    async function completeLiveness() {
+        clearInterval(scanInterval);
+        document.getElementById('instruction').innerText = 'ทดสอบแสงสะท้อน...';
+        
+        const colors = ['rgba(255,0,0,0.6)', 'rgba(0,0,255,0.6)', 'rgba(255,255,0,0.6)', 'rgba(0,255,0,0.6)'];
+        const overlay = document.getElementById('colorFlashOverlay');
+        for(let c of colors) {
+            overlay.style.backgroundColor = c; overlay.style.opacity = '1';
+            await new Promise(r => setTimeout(r, 200));
+        }
+        overlay.style.opacity = '0';
+        document.getElementById('instruction').innerText = 'กำลังประมวลผล...';
+        
+        const video = document.getElementById('faceVideo');
+        const detections = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
+        
+        if(detections) processFaceResult(detections.descriptor);
+        else Swal.fire('ข้อผิดพลาด', 'หลุดเฟรมขณะประมวลผล กรุณาลองใหม่', 'error').then(() => { startCamera(); });
+    }
+
+    async function processFaceResult(descriptor) {
+        if (mode === 'admin') {
+            document.getElementById('instruction').innerText = 'กำลังบันทึกลงฐานข้อมูล...';
+            try {
+                const res = await fetch(gasApi, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ action: 'saveFace', id: studentId, descriptor: JSON.stringify(Array.from(descriptor)) })
+                });
+                const result = await res.json();
+                if(result.success) returnSuccessBack();
+                else Swal.fire('ผิดพลาด', result.message, 'error').then(goBack);
+            } catch (err) {
+                Swal.fire('ผิดพลาด', 'ส่งข้อมูลไม่ได้', 'error').then(goBack);
+            }
+        } else if (mode === 'login') {
+            const distance = faceapi.euclideanDistance(descriptor, savedDescriptor);
+            if (distance < 0.5) {
+                returnSuccessBack();
+            } else {
+                Swal.fire('ผิดพลาด', 'ใบหน้าไม่ตรงกับที่ลงทะเบียนไว้', 'error').then(goBack);
+            }
+        }
+    }
+
+    function returnSuccessBack() {
+        const target = returnUrl + `?action=face_success&mode=${mode}&id=${encodeURIComponent(studentId)}&name=${encodeURIComponent(studentName)}&email=${encodeURIComponent(studentEmail)}`;
+        window.location.href = target;
+    }
+
+    function goBack() {
+        if(returnUrl) window.location.href = returnUrl;
+    }
+  </script>
+</body>
+</html>
